@@ -1,5 +1,14 @@
 package it.begenau.sample.messaging.application;
 
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
+import io.opentelemetry.instrumentation.api.instrumenter.AttributesExtractor;
+import io.opentelemetry.instrumentation.api.instrumenter.messaging.MessageOperation;
+import io.opentelemetry.instrumentation.api.instrumenter.messaging.MessagingAttributesExtractor;
 import jakarta.jms.*;
 import jakarta.transaction.SystemException;
 import jakarta.transaction.TransactionManager;
@@ -16,13 +25,6 @@ import java.util.concurrent.ExecutorService;
 @Slf4j
 class MessageListenerHolder {
     static final String ACKNOWLEDGE_MODE = "acknowledgeMode";
-    private static final String MESSAGE_SELECTOR = "messageSelector";
-    private static final String DESTINATION_TYPE = "destinationType";
-    private static final String DESTINATION_LOOKUP = "destinationLookup";
-    private static final String CONNECTION_FACTORY_LOOKUP = "connectionFactoryLookup";
-    private static final String SUBSCRIPTION_DURABILITY = "subscriptionDurability";
-    private static final String SUBSCRIPTION_NAME = "subscriptionName";
-    private static final String CLIENT_ID = "clientId";
     private final Map<String, String> props;
     private final MessageListener listener;
     private XAJMSContext context;
@@ -32,11 +34,16 @@ class MessageListenerHolder {
     private boolean started = false;
     private final boolean autoAcknowledge;
     private CompletableFuture<Void> cf;
+
     private final XAConnectionFactory factory;
     private final ExecutorService executor;
     private final TransactionManager tm;
+    private final Tracer tracer;
+    private final AttributesExtractor<Message, Void> extractor;
 
-    public MessageListenerHolder(String listenerName, Map<String, String> props, MessageListener listener, XAConnectionFactory factory, ExecutorService executorService, TransactionManager tm) {
+    public MessageListenerHolder(String listenerName, Map<String, String> props, MessageListener listener,
+                                 XAConnectionFactory factory, ExecutorService executorService, TransactionManager tm,
+                                 Tracer tracer) {
         this.listenerName = listenerName;
         this.props = props;
         this.listener = listener;
@@ -44,9 +51,12 @@ class MessageListenerHolder {
         this.factory = factory;
         this.executor = executorService;
         this.tm = tm;
+        this.tracer = tracer;
+        this.extractor = MessagingAttributesExtractor.builder(JmsMessagingAttributesGetter.INSTANCE, MessageOperation.RECEIVE).build();
     }
 
-    private static JMSConsumer createConsumer(XAJMSContext context, String listenerName, Map<String, String> props, String destinationName, Optional<String> selector) throws JMSException {
+    private static JMSConsumer createConsumer(XAJMSContext context, String listenerName, Map<String, String> props,
+                                              String destinationName, Optional<String> selector) throws JMSException {
         final JMSConsumer jmsConsumer;
         if (isTopic(props)) {
             final Topic topic = context.createTopic(destinationName);
@@ -80,11 +90,11 @@ class MessageListenerHolder {
     }
 
     private static boolean isDurable(Map<String, String> props) {
-        return "NonDurable".equals(props.getOrDefault(SUBSCRIPTION_DURABILITY, "NonDurable"));
+        return "NonDurable".equals(props.getOrDefault(ActivationProperties.SUBSCRIPTION_DURABILITY, "NonDurable"));
     }
 
     private static boolean isTopic(Map<String, String> props) {
-        return switch (props.get(DESTINATION_TYPE)) {
+        return switch (props.get(ActivationProperties.DESTINATION_TYPE)) {
             case "jakarta.jms.Queue" -> false;
             case "jakarta.jms.Topic" -> true;
             default -> throw new IllegalArgumentException("No or unknown destinationType in ActivationConfig");
@@ -92,12 +102,12 @@ class MessageListenerHolder {
     }
 
     private static Optional<String> getSelector(Map<String, String> props) {
-        return Optional.ofNullable(props.get(MESSAGE_SELECTOR));
+        return Optional.ofNullable(props.get(ActivationProperties.MESSAGE_SELECTOR));
     }
 
     private static String getDestinationName(Map<String, String> props) {
         // This is a JNDI-Name. For Quarkus, we assume there is a matching Property with the Prefix FOO
-        return ConfigProvider.getConfig().getValue(props.get(DESTINATION_LOOKUP), String.class);
+        return ConfigProvider.getConfig().getValue(props.get(ActivationProperties.DESTINATION_LOOKUP), String.class);
     }
 
     public void listen() {
@@ -163,18 +173,30 @@ class MessageListenerHolder {
             if (message == null) continue;
 
             try {
-                log.trace("Processing message {}", message.getJMSMessageID());
+                Context parentContext =
 
-                tm.begin();
-                tm.getTransaction().enlistResource(this.context.getXAResource());
 
-                listener.onMessage(message);
+                        GlobalOpenTelemetry.getPropagators().getTextMapPropagator()
+                                .extract(Context.current(), message, JmsMessagingAttributesGetter.INSTANCE);
+                var childSpan = tracer.spanBuilder(listenerName)
+                        .setAllAttributes(extractAttributes(message, parentContext))
+                        .setParent(parentContext).startSpan();
+                try (Scope ignored = childSpan.makeCurrent()) {
 
-                if (autoAcknowledge) {
-                    message.acknowledge();
+                    log.trace("Processing message {}", message.getJMSMessageID());
+
+                    tm.begin();
+                    tm.getTransaction().enlistResource(this.context.getXAResource());
+
+                    listener.onMessage(message);
+
+                    if (autoAcknowledge) {
+                        message.acknowledge();
+                    }
+
+                    tm.commit();
                 }
-
-                tm.commit();
+                childSpan.end();
 
                 log.trace("Done processing message {}", message.getJMSMessageID());
             } catch (IllegalStateRuntimeException rte) {
@@ -191,9 +213,16 @@ class MessageListenerHolder {
                     log.error("Exception processing message.", t);
                     log.error("Error rolling back.", e);
                 }
-                // context.getXAResource().end();
             }
         }
+    }
+
+    private Attributes extractAttributes(Message message, Context traceContext) {
+        var builder = Attributes.builder();
+
+        extractor.onStart(builder, traceContext, message);
+
+        return builder.build();
     }
 
     private boolean isAutoAcknowledge(Map<String, String> props) {

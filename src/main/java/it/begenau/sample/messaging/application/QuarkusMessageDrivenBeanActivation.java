@@ -1,5 +1,6 @@
 package it.begenau.sample.messaging.application;
 
+import io.opentelemetry.api.trace.Tracer;
 import io.quarkus.arc.ClientProxy;
 import io.quarkus.arc.Subclass;
 import jakarta.ejb.ActivationConfigProperty;
@@ -37,11 +38,13 @@ public class QuarkusMessageDrivenBeanActivation implements HealthCheck {
     private final Map<String, MessageListenerHolder> holders = new ConcurrentHashMap<>();
 
     private final ExecutorService executorService = Executors.newCachedThreadPool();
+    private final Tracer tracer;
 
-    public QuarkusMessageDrivenBeanActivation(XAConnectionFactory factory, @Any Instance<MessageListener> listeners, TransactionManager tm) {
+    public QuarkusMessageDrivenBeanActivation(XAConnectionFactory factory, @Any Instance<MessageListener> listeners, TransactionManager tm, Tracer tracer) {
         this.factory = factory;
         this.listeners = listeners;
         this.tm = tm;
+        this.tracer = tracer;
     }
 
     public void init(@Observes Startup startup) {
@@ -55,7 +58,7 @@ public class QuarkusMessageDrivenBeanActivation implements HealthCheck {
 
             Map<String, String> props = Arrays.stream(clazz.getAnnotation(MessageDriven.class).activationConfig()).collect(Collectors.toMap(ActivationConfigProperty::propertyName, ActivationConfigProperty::propertyValue));
 
-            MessageListenerHolder holder = new MessageListenerHolder(listenerName, props, listener, factory, executorService, tm);
+            MessageListenerHolder holder = new MessageListenerHolder(listenerName, props, listener, factory, executorService, tm, tracer);
             holders.put(listenerName, holder);
 
             holder.listen();

@@ -1,6 +1,5 @@
 package it.begenau.sample.messaging.adapter.foo_jms;
 
-import it.begenau.sample.messaging.MyModel;
 import it.begenau.sample.messaging.domain.ports.StoreMessageInDatabase;
 import jakarta.ejb.ActivationConfigProperty;
 import jakarta.ejb.MessageDriven;
@@ -13,8 +12,6 @@ import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.microprofile.metrics.annotation.Counted;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import java.util.concurrent.atomic.AtomicInteger;
